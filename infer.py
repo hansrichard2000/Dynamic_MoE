@@ -22,7 +22,9 @@ def generate(tokenizer, model, text):
     
 
 if __name__ == "__main__":
-    model_path = 'path_to_dynamicmoe_moedel'
+    # model_path = 'AnLan577/Dynamic_MoE'
+    # model_path = 'meta-llama/Llama-2-7b-hf'
+    model_path = 'facebook/opt-350m'
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.unk_token
 

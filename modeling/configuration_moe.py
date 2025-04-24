@@ -107,7 +107,7 @@ class MoEConfig(PretrainedConfig):
         tie_word_embeddings=False,
         rope_theta=10000.0,
         rope_scaling=None,
-        num_experts=-1,
+        num_experts=1,
         experts_topk=2,
         expert_frequency=2,
         top_p_threshold=0.4,
