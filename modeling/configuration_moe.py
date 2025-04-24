@@ -17,13 +17,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" LLaMA model configuration"""
+""" Mistral model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
-LLAMA_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
+MISTRAL_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 class MoEConfig(PretrainedConfig):
     r"""
@@ -84,7 +84,7 @@ class MoEConfig(PretrainedConfig):
             https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
             experimental feature, subject to breaking API changes in future versions.
     """
-    model_type = "llama"
+    model_type = "mistral"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -107,7 +107,7 @@ class MoEConfig(PretrainedConfig):
         tie_word_embeddings=False,
         rope_theta=10000.0,
         rope_scaling=None,
-        num_experts=-1,
+        num_experts=8,
         experts_topk=2,
         expert_frequency=2,
         top_p_threshold=0.4,

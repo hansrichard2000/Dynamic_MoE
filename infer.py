@@ -22,7 +22,7 @@ def generate(tokenizer, model, text):
     
 
 if __name__ == "__main__":
-    model_path = 'path_to_dynamicmoe_moedel'
+    model_path = 'mistralai/Mistral-7B-v0.1'
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.unk_token
 
@@ -32,7 +32,8 @@ if __name__ == "__main__":
         from_tf=False,
         config=model_config,
         torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True
+        # low_cpu_mem_usage=True,
+        ignore_mismatched_sizes=True
     ).cuda()    
     model.eval() 
 
