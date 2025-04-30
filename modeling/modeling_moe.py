@@ -37,7 +37,7 @@ from .configuration_moe import MoEOPTConfig
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "LlamaConfig"
+_CONFIG_FOR_DOC = "OPTConfig"
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -50,7 +50,8 @@ def _make_causal_mask(input_ids_shape, dtype, device, past_key_values_length=0):
     mask = torch.triu(mask, diagonal=1)
 
     if past_key_values_length > 0:
-        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
+        left_pad = torch.zeros((tgt_len, past_key_values_length), device=device)
+        mask = torch.cat([left_pad, mask], dim=-1)
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 
 
@@ -59,14 +60,14 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
-    bsz, src_len = mask.size()
+    bsz, src_len = mask.shape
     tgt_len = tgt_len if tgt_len is not None else src_len
 
-    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len)
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
 
     inverted_mask = 1.0 - expanded_mask
 
-    return inverted_mask.masked_fill(inverted_mask.bool(), float("-inf")).to(dtype)
+    return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 class OPTLayerNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-5):
@@ -234,39 +235,64 @@ class OPTAttention(nn.Module):
         use_cache=False,
     ):
         bsz, seq_len, _ = hidden_states.size()
-
+    
+        # Project and reshape
         query = self._split_heads(self.q_proj(hidden_states), bsz, seq_len)
         key = self._split_heads(self.k_proj(hidden_states), bsz, seq_len)
         value = self._split_heads(self.v_proj(hidden_states), bsz, seq_len)
-
+    
+        # Append past if exists
         if past_key_value is not None:
             past_key, past_value = past_key_value
             key = torch.cat([past_key, key], dim=2)
             value = torch.cat([past_value, value], dim=2)
-
+    
         present_key_value = (key, value) if use_cache else None
-
-        attn_weights = torch.matmul(query, key.transpose(-1, -2)) * self.scale
-
+    
+        # Compute attention scores
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))  # [bsz, heads, tgt_len, src_len]
+    
+        # Fix known edge case NaNs
+        attn_weights = attn_weights.masked_fill(torch.isnan(attn_weights), -1e4)
+    
+        # Ensure attention_mask matches key size
         if attention_mask is not None:
-            attn_weights += attention_mask
-
+            src_len = key.size(2)
+            expected_mask_shape = (bsz, 1, seq_len, src_len)
+            if attention_mask.shape[-1] != src_len:
+                # Dynamically slice attention mask for generate()
+                attention_mask = attention_mask[:, :, :, -src_len:]
+    
+            if attention_mask.shape != expected_mask_shape:
+                raise ValueError(
+                    f"[ERROR] attention_mask shape {attention_mask.shape} != expected {expected_mask_shape}"
+                )
+    
+            attn_weights = attn_weights + attention_mask
+    
+        # Apply softmax + dropout
         attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+        attn_probs = torch.nan_to_num(attn_probs, nan=0.0)
         attn_probs = self.dropout(attn_probs)
-
-        # ✅ Fix dtype mismatch for mixed precision
-        attn_probs = attn_probs.to(value.dtype)
-
+    
+        attn_probs = attn_probs.to(value.dtype)  # dtype match
+    
+        # Weighted sum of values
         attn_output = torch.matmul(attn_probs, value)
         attn_output = self._merge_heads(attn_output, bsz, seq_len)
         attn_output = self.out_proj(attn_output)
-
-        # ✅ Always return 3-tuple for unpacking
+    
+        # Final safety clamp
+        if torch.any(torch.isnan(attn_output)) or torch.any(torch.isinf(attn_output)):
+            print("[FIX] Clamping attention output to remove NaNs/Infs")
+            attn_output = torch.nan_to_num(attn_output, nan=0.0, posinf=1e4, neginf=-1e4)
+    
         return (
             attn_output,
             attn_probs if output_attentions else None,
             present_key_value,
         )
+
 
 class OPTDecoderLayer(nn.Module):
     def __init__(self, config: MoEOPTConfig, layer_idx: int):
@@ -304,6 +330,9 @@ class OPTDecoderLayer(nn.Module):
         # Feed Forward / Switch MLP
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
+        if torch.any(torch.isnan(hidden_states)) or torch.any(torch.isinf(hidden_states)):
+            print("[FIX] Clamping residual + attention output before MoE")
+            hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=1e4, neginf=-1e4)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         hidden_states = self.dropout(hidden_states)
@@ -458,28 +487,33 @@ class MoEOPTModel(MoEPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
     # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
-    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        combined_attention_mask = None
-        if input_shape[-1] > 1:
-            combined_attention_mask = _make_causal_mask(
-                input_shape,
-                inputs_embeds.dtype,
-                device=inputs_embeds.device,
-                past_key_values_length=past_key_values_length,
-            )
+    
+    def _prepare_decoder_attention_mask(
+        self,
+        attention_mask,
+        input_shape,
+        inputs_embeds,
+        past_key_values_length: int,
+    ):
+        bsz, tgt_len = input_shape
+        dtype = inputs_embeds.dtype
+        device = inputs_embeds.device
 
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
-                inputs_embeds.device
-            )
-            combined_attention_mask = (
-                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
-            )
+        src_len = attention_mask.shape[1]  # dynamic src length during generation
 
-        return combined_attention_mask
+        # Generate causal mask [tgt_len, src_len]
+        causal_mask = torch.full((tgt_len, src_len), float("-inf"), device=device, dtype=dtype)
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        causal_mask = causal_mask[None, None, :, :].expand(bsz, 1, tgt_len, src_len)
+
+        # Expand attention mask [bsz, src_len] → [bsz, 1, tgt_len, src_len]
+        expanded_mask = attention_mask[:, None, None, :].to(dtype)
+        expanded_mask = (1.0 - expanded_mask) * torch.finfo(dtype).min
+        expanded_mask = expanded_mask.expand(bsz, 1, tgt_len, src_len)
+
+        # Combine
+        return expanded_mask + causal_mask
+    
     @add_start_docstrings_to_model_forward(OPT_INPUTS_DOCSTRING)
     def forward(
         self,
@@ -502,7 +536,8 @@ class MoEOPTModel(MoEPreTrainedModel):
         # Validate input_ids vs. inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time.")
-        elif input_ids is not None:
+        
+        if input_ids is not None:
             batch_size, seq_length = input_ids.shape
         elif inputs_embeds is not None:
             batch_size, seq_length, _ = inputs_embeds.shape
@@ -511,9 +546,14 @@ class MoEOPTModel(MoEPreTrainedModel):
     
         # Handle past key values
         past_key_values_length = 0
-        if past_key_values is not None:
+        if (
+            past_key_values is not None
+            and isinstance(past_key_values, list)
+            and len(past_key_values) > 0
+            and past_key_values[0] is not None
+        ):
             past_key_values_length = past_key_values[0][0].shape[2]
-    
+
         # Generate position_ids if not provided
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
