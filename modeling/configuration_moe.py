@@ -19,13 +19,13 @@
 # limitations under the License.
 """ LLaMA model configuration"""
 
-from transformers.configuration_utils import PretrainedConfig
+from transformers import OPTConfig
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 LLAMA_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
-class MoEConfig(PretrainedConfig):
+class MoEOPTConfig(OPTConfig):
     r"""
     This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -84,61 +84,43 @@ class MoEConfig(PretrainedConfig):
             https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
             experimental feature, subject to breaking API changes in future versions.
     """
-    model_type = "llama"
+    model_type = "opt"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        vocab_size=32000,
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=None,
-        hidden_act="silu",
+        vocab_size=50272,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        activation_function="gelu",
         max_position_embeddings=2048,
         initializer_range=0.02,
-        rms_norm_eps=1e-6,
+        attention_dropout=0.1,
         use_cache=True,
-        pad_token_id=None,
-        bos_token_id=1,
+        pad_token_id=1,
+        bos_token_id=0,
         eos_token_id=2,
-        pretraining_tp=1,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        num_experts=1,
+        tie_word_embeddings=True,
+        num_experts=2,
         experts_topk=2,
-        expert_frequency=2,
-        top_p_threshold=0.4,
+        expert_frequency=1,
+        top_p_threshold=0.9,
+        layer_norm_eps=1e-5,
         **kwargs,
     ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_experts = num_experts
-        self.expert_frequency = expert_frequency
-        self.experts_topk = experts_topk 
-        self.top_p_threshold = top_p_threshold
-        
-        # for backward compatibility
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.pretraining_tp = pretraining_tp
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self._rope_scaling_validation()
-
         super().__init__(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            activation_function=activation_function,
+            max_position_embeddings=max_position_embeddings,
+            initializer_range=initializer_range,
+            attention_dropout=attention_dropout,
+            use_cache=use_cache,
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -146,23 +128,34 @@ class MoEConfig(PretrainedConfig):
             **kwargs,
         )
 
+        self.num_experts = num_experts
+        self.experts_topk = experts_topk
+        self.expert_frequency = expert_frequency
+        self.top_p_threshold = top_p_threshold
+        self.layer_norm_eps = layer_norm_eps
+
     def _rope_scaling_validation(self):
         """
-        Validate the `rope_scaling` configuration.
+        Validate the `rope_scaling` dictionary.
+    
+        - It must be a dict with keys 'type' and 'factor'.
+        - 'type' must be 'linear' or 'dynamic'.
+        - 'factor' must be a float > 1.0.
         """
         if self.rope_scaling is None:
             return
-
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 2:
-            raise ValueError(
-                "`rope_scaling` must be a dictionary with with two fields, `name` and `factor`, "
-                f"got {self.rope_scaling}"
-            )
-        rope_scaling_type = self.rope_scaling.get("type", None)
-        rope_scaling_factor = self.rope_scaling.get("factor", None)
-        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
-            raise ValueError(
-                f"`rope_scaling`'s name field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
-            )
-        if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
-            raise ValueError(f"`rope_scaling`'s factor field must be an float > 1, got {rope_scaling_factor}")
+    
+        if not isinstance(self.rope_scaling, dict):
+            raise ValueError(f"`rope_scaling` must be a dictionary, got {type(self.rope_scaling)}")
+    
+        if "type" not in self.rope_scaling or "factor" not in self.rope_scaling:
+            raise ValueError(f"`rope_scaling` must contain both 'type' and 'factor' keys, got {self.rope_scaling}")
+    
+        rope_type = self.rope_scaling["type"]
+        rope_factor = self.rope_scaling["factor"]
+    
+        if rope_type not in ["linear", "dynamic"]:
+            raise ValueError(f"`rope_scaling['type']` must be 'linear' or 'dynamic', got {rope_type}")
+    
+        if not isinstance(rope_factor, float) or rope_factor <= 1.0:
+            raise ValueError(f"`rope_scaling['factor']` must be a float > 1.0, got {rope_factor}")
