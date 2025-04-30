@@ -3,8 +3,6 @@ import torch
 from modeling.modeling_moe import MoEForCausalLM
 from modeling.configuration_moe import MoEConfig
 
-
-
 def generate(tokenizer, model, text):
     inputs = [text]
     tokens = tokenizer(inputs,return_tensors="pt")
@@ -22,18 +20,19 @@ def generate(tokenizer, model, text):
     
 
 if __name__ == "__main__":
-    model_path = 'path_to_dynamicmoe_moedel'
+    model_path = 'meta-llama/Llama-2-7b-hf'
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.unk_token
 
-    model_config = MoEConfig.from_pretrained(model_path,trust_remote_code=True)
+    model_config = MoEConfig.from_pretrained(model_path, trust_remote_code=True)
     model = MoEForCausalLM.from_pretrained(
         model_path,
         from_tf=False,
         config=model_config,
         torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True
-    ).cuda()    
+        low_cpu_mem_usage=True,
+        device_map="cuda"
+    )
     model.eval() 
 
     response = generate(tokenizer, model, 'The highest mountain in the world is')

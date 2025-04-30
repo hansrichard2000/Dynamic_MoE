@@ -25,7 +25,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-
+from transformers.generation.logits_process import LogitsProcessorList, LogitsProcessor
 from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -679,6 +679,17 @@ class MoEModel(MoEPreTrainedModel):
             attentions=all_self_attns,
         )
 
+# class SafeLogitsProcessor(LogitsProcessor):
+#     def __call__(self, input_ids, scores):
+#         # scores = logits before softmax
+#         if torch.any(torch.isnan(scores)) or torch.any(torch.isinf(scores)):
+#             print("[LogitsProcessor] Detected NaNs or Infs in logits. Sanitizing...")
+#             scores = torch.nan_to_num(scores, nan=0.0, posinf=1e4, neginf=-1e4)
+        
+#         # Clamp to prevent extreme softmax overflow
+#         scores = torch.clamp(scores, min=-100, max=100)
+#         return scores
+
 class MoEForCausalLM(MoEPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -785,6 +796,12 @@ class MoEForCausalLM(MoEPreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
+        if torch.any(torch.isnan(logits)) or torch.any(torch.isinf(logits)) or (logits < -1e10).any():
+            print("[ERROR] Detected invalid values in logits!")
+            print("Logits stats: min =", logits.min().item(), "max =", logits.max().item())
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -829,6 +846,16 @@ class MoEForCausalLM(MoEPreTrainedModel):
         for layer_past in past_key_values:
             reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
         return reordered_past
+    
+    # def prepare_logits_processor(
+    #     self,
+    #     input_ids,
+    #     scores=None,
+    #     **kwargs
+    # ) -> LogitsProcessorList:
+    #     processors = super().prepare_logits_processor(input_ids, scores=scores, **kwargs)
+    #     processors.append(SafeLogitsProcessor())  # <- inject sanitization
+    #     return processors
 
 @add_start_docstrings(
     """
