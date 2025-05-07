@@ -25,7 +25,9 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-
+from transformers.generation.logits_process import LogitsProcessor
+from transformers.generation.utils import GenerationConfig
+from transformers.generation.logits_process import LogitsProcessorList, RepetitionPenaltyLogitsProcessor
 from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -186,53 +188,117 @@ def top_p_sampling_batched_all_sequence(logits, top_p=0.9, temperature=1.0):
     return sorted_probs, sorted_indices
 
 class SwitchMLP(nn.Module):
-    """
-    Routes input to one of N MLP "experts"
-    """
     def __init__(self, config, layer_idx):
-        super(SwitchMLP, self).__init__()
-        self.layer_num = layer_idx
-        self.use_switch = (layer_idx % config.expert_frequency) == 0 # Ensure the first layer use switch mlp
+        super().__init__()
+        self.use_switch = (layer_idx % config.expert_frequency) == 0
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.top_p_threshold = config.top_p_threshold
+        self.num_experts = config.num_experts
+
         if self.use_switch:
-            self.top_p_threshold = config.top_p_threshold
-            self.router = torch.nn.Linear(config.hidden_size, config.num_experts, bias=False)
-            self.experts = torch.nn.ModuleList()
-            self.num_experts = config.num_experts
-            for i in range(config.num_experts):
-                self.experts.append(LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act))
+            self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+            self.experts = nn.ModuleList([
+                LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+                for _ in range(self.num_experts)
+            ])
         else:
             self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
-        
+
     def forward(self, hidden_states):
         if not self.use_switch:
-            output = self.mlp(hidden_states)
-            return output
+            return self.mlp(hidden_states)
 
-        s = hidden_states.size(0)
-        b = hidden_states.size(1)
-        h = hidden_states.size(2)
+        B, T, H = hidden_states.shape
+        route_logits = self.router(hidden_states)  # (B, T, E)
+        route_probs = torch.softmax(route_logits, dim=-1)
 
-        route = self.router(hidden_states) 
-        route = torch.nn.functional.softmax(route, dim=2)
+        # Safe Top-p per token
+        sorted_probs, sorted_idx = torch.sort(route_probs, descending=True, dim=-1)
+        cum_probs = torch.cumsum(sorted_probs, dim=-1)
+        top_p_mask = cum_probs <= self.top_p_threshold
+
+        # Ensure at least 1 expert per token
+        top_p_mask[..., 0] = 1
+        selected_idx = torch.where(top_p_mask, sorted_idx, torch.full_like(sorted_idx, -1))
+
+        flat_hidden = hidden_states.view(-1, H)  # (B*T, H)
+        flat_selected = selected_idx.view(-1, selected_idx.size(-1))  # (B*T, top_p?)
+        flat_probs = torch.gather(route_probs.view(-1, self.num_experts), 1, flat_selected.clamp(min=0))
+
+        output = torch.zeros_like(flat_hidden)
+        for i, expert in enumerate(self.experts):
+            mask = flat_selected == i
+            active = mask.any(dim=1)
+            if not active.any():
+                continue
+            x = flat_hidden[active]
+            
+            # w = flat_probs[active, mask[active]].unsqueeze(-1)
+            expert_mask = mask[active]  # shape: [num_active, top_p]
+            prob_slice = flat_probs[active]  # shape: [num_active, top_p]
+            expert_weights = torch.where(expert_mask, prob_slice, torch.zeros_like(prob_slice))  # zero out others
+            weight_sum = expert_weights.sum(dim=1, keepdim=True).clamp(min=1e-6)  # prevent div by zero
+            normalized_weights = expert_weights.sum(dim=1, keepdim=True) / weight_sum
+            w = normalized_weights
+            
+            y = expert(x)
+            if torch.any(torch.isnan(y)) or torch.any(torch.isinf(y)):
+                print(f"[WARN] Expert {i} produced NaN/Inf")
+                y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
+            output[active] += w * y
+
+        return output.view(B, T, H)
+
+
+# class SwitchMLP(nn.Module):
+#     """
+#     Routes input to one of N MLP "experts"
+#     """
+#     def __init__(self, config, layer_idx):
+#         super(SwitchMLP, self).__init__()
+#         self.layer_num = layer_idx
+#         self.use_switch = (layer_idx % config.expert_frequency) == 0 # Ensure the first layer use switch mlp
+#         if self.use_switch:
+#             self.top_p_threshold = config.top_p_threshold
+#             self.router = torch.nn.Linear(config.hidden_size, config.num_experts, bias=False)
+#             self.experts = torch.nn.ModuleList()
+#             self.num_experts = config.num_experts
+#             for i in range(config.num_experts):
+#                 self.experts.append(LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act))
+#         else:
+#             self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+        
+#     def forward(self, hidden_states):
+#         if not self.use_switch:
+#             output = self.mlp(hidden_states)
+#             return output
+
+#         s = hidden_states.size(0)
+#         b = hidden_states.size(1)
+#         h = hidden_states.size(2)
+
+#         route = self.router(hidden_states) 
+#         route = torch.nn.functional.softmax(route, dim=2)
         
 
-        topk_weights, topk_ind = top_p_sampling_batched_all_sequence(route, self.top_p_threshold)
+#         topk_weights, topk_ind = top_p_sampling_batched_all_sequence(route, self.top_p_threshold)
         
 
-        hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
-        topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
-        topk_ind = topk_ind.view(-1, topk_ind.size(2))
+#         hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
+#         topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
+#         topk_ind = topk_ind.view(-1, topk_ind.size(2))
 
-        output_total = torch.zeros_like(hidden_states).to(hidden_states)
-        for expert_num, expert in enumerate(self.experts):
-            sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
-            hidden = hidden_states[sample_ind.unsqueeze(1), :] 
-            expert_output = expert(hidden)
-            output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
+#         output_total = torch.zeros_like(hidden_states).to(hidden_states)
+#         for expert_num, expert in enumerate(self.experts):
+#             sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
+#             hidden = hidden_states[sample_ind.unsqueeze(1), :] 
+#             expert_output = expert(hidden)
+#             output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
 
 
-        output_total = output_total.view(s, b, h)
-        return output_total
+#         output_total = output_total.view(s, b, h)
+#         return output_total
                 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -678,6 +744,18 @@ class MoEModel(MoEPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+        
+class SafeLogitsProcessor(LogitsProcessor):
+    def __call__(self, input_ids, scores):
+        if torch.any(torch.isnan(scores)) or torch.any(torch.isinf(scores)):
+            print("[LogitsProcessor] Fixing invalid scores...")
+            scores = torch.nan_to_num(scores, nan=0.0, posinf=1e4, neginf=-1e4)
+        return torch.clamp(scores, min=-100, max=100)
+
+def prepare_logits_processor(self, input_ids, scores=None, **kwargs):
+        processor = super().prepare_logits_processor(input_ids, scores=scores, **kwargs)
+        processor.append(SafeLogitsProcessor())
+        return processor
 
 class MoEForCausalLM(MoEPreTrainedModel):
     def __init__(self, config):
@@ -707,53 +785,20 @@ class MoEForCausalLM(MoEPreTrainedModel):
         return self.model
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-        r"""
-        Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, LlamaForCausalLM
-
-        >>> model = LlamaForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
-        >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
-
-        >>> prompt = "Hey, are you consciours? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
-        ```"""
-
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+    # @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    def forward(self,
+            input_ids=None,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=None,
+            labels=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -765,21 +810,27 @@ class MoEForCausalLM(MoEPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
+        # ✅ Patch to prevent multinomial crash
+        if torch.any(torch.isnan(logits)) or torch.any(torch.isinf(logits)):
+            print("[FATAL] Invalid logits detected. Sanitizing...")
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        logits = torch.clamp(logits, min=-100, max=100)
+
+        if logits.shape[-1] != self.config.vocab_size:
+            raise ValueError(f"[ERROR] Logits dim {logits.shape[-1]} != vocab size {self.config.vocab_size}")
+
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_logits = shift_logits.view(-1, shift_logits.size(-1))
             shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss = nn.CrossEntropyLoss()(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -792,6 +843,105 @@ class MoEForCausalLM(MoEPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+    # def forward(
+    #     self,
+    #     input_ids: torch.LongTensor = None,
+    #     attention_mask: Optional[torch.Tensor] = None,
+    #     position_ids: Optional[torch.LongTensor] = None,
+    #     past_key_values: Optional[List[torch.FloatTensor]] = None,
+    #     inputs_embeds: Optional[torch.FloatTensor] = None,
+    #     labels: Optional[torch.LongTensor] = None,
+    #     use_cache: Optional[bool] = None,
+    #     output_attentions: Optional[bool] = None,
+    #     output_hidden_states: Optional[bool] = None,
+    #     return_dict: Optional[bool] = None,
+    # ) -> Union[Tuple, CausalLMOutputWithPast]:
+    #     r"""
+    #     Args:
+    #         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+    #             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+    #             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+    #             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+    #     Returns:
+
+    #     Example:
+
+    #     ```python
+    #     >>> from transformers import AutoTokenizer, LlamaForCausalLM
+
+    #     >>> model = LlamaForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
+    #     >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
+
+    #     >>> prompt = "Hey, are you consciours? Can you talk to me?"
+    #     >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+    #     >>> # Generate
+    #     >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+    #     >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+    #     "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
+    #     ```"""
+
+    #     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    #     output_hidden_states = (
+    #         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    #     )
+    #     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    #     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+    #     outputs = self.model(
+    #         input_ids=input_ids,
+    #         attention_mask=attention_mask,
+    #         position_ids=position_ids,
+    #         past_key_values=past_key_values,
+    #         inputs_embeds=inputs_embeds,
+    #         use_cache=use_cache,
+    #         output_attentions=output_attentions,
+    #         output_hidden_states=output_hidden_states,
+    #         return_dict=return_dict,
+    #     )
+    #     hidden_states = outputs[0]
+    #     logits = self.lm_head(hidden_states)
+
+    #     loss = None
+    #     if labels is not None:
+    #         # Shift so that tokens < n predict n
+    #         shift_logits = logits[..., :-1, :].contiguous()
+    #         shift_labels = labels[..., 1:].contiguous()
+    #         # Flatten the tokens
+    #         loss_fct = CrossEntropyLoss()
+    #         shift_logits = shift_logits.view(-1, self.config.vocab_size)
+    #         shift_labels = shift_labels.view(-1)
+    #         # Enable model parallelism
+    #         shift_labels = shift_labels.to(shift_logits.device)
+    #         loss = loss_fct(shift_logits, shift_labels)
+
+    #     if not return_dict:
+    #         output = (logits,) + outputs[1:]
+    #         return (loss,) + output if loss is not None else output
+
+    #     return CausalLMOutputWithPast(
+    #         loss=loss,
+    #         logits=logits,
+    #         past_key_values=outputs.past_key_values,
+    #         hidden_states=outputs.hidden_states,
+    #         attentions=outputs.attentions,
+    #     )
+        
+    def prepare_logits_processor(self, input_ids, scores=None, **kwargs):
+        from transformers.generation.utils import GenerationConfig
+        from transformers.generation.logits_process import LogitsProcessorList, RepetitionPenaltyLogitsProcessor
+
+        logits_processor = LogitsProcessorList()
+        generation_config = kwargs.get("generation_config", GenerationConfig())
+
+        if generation_config.repetition_penalty != 1.0:
+            logits_processor.append(RepetitionPenaltyLogitsProcessor(penalty=generation_config.repetition_penalty))
+
+        # ✅ Add the safe logits processor
+        logits_processor.append(SafeLogitsProcessor())
+
+        return logits_processor
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
