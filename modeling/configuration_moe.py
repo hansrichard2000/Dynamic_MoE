@@ -25,7 +25,7 @@ logger = logging.get_logger(__name__)
 
 LLAMA_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
-class MoEConfig(PretrainedConfig):
+class LlamaConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -107,7 +107,7 @@ class MoEConfig(PretrainedConfig):
         tie_word_embeddings=False,
         rope_theta=10000.0,
         rope_scaling=None,
-        num_experts=-1,
+        num_experts=1,
         experts_topk=2,
         expert_frequency=2,
         top_p_threshold=0.4,

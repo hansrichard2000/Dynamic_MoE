@@ -32,7 +32,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.utils import logging, add_start_docstrings, add_start_docstrings_to_model_forward, replace_return_docstrings
 
-from .configuration_moe import MoEConfig
+from .configuration_moe import LlamaConfig
 
 logger = logging.get_logger(__name__)
 
@@ -228,6 +228,12 @@ class SwitchMLP(nn.Module):
             sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
             hidden = hidden_states[sample_ind.unsqueeze(1), :] 
             expert_output = expert(hidden)
+            
+            # Debugging for NaNs/Infs
+            if torch.isnan(expert_output).any() or torch.isinf(expert_output).any():
+                print(f"[DEBUG] NaNs/Infs detected in expert {expert_num}")
+                expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=1e4, neginf=-1e4)
+            
             output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
 
 
@@ -237,7 +243,7 @@ class SwitchMLP(nn.Module):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: MoEConfig):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -323,7 +329,7 @@ class LlamaAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: MoEConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
@@ -415,7 +421,7 @@ LLAMA_START_DOCSTRING = r"""
     LLAMA_START_DOCSTRING,
 )
 class MoEPreTrainedModel(PreTrainedModel):
-    config_class = MoEConfig
+    config_class = LlamaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["LlamaDecoderLayer"]
@@ -510,7 +516,7 @@ class MoEModel(MoEPreTrainedModel):
         config: LlamaConfig
     """
 
-    def __init__(self, config: MoEConfig):
+    def __init__(self, config: LlamaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -679,7 +685,7 @@ class MoEModel(MoEPreTrainedModel):
             attentions=all_self_attns,
         )
 
-class MoEForCausalLM(MoEPreTrainedModel):
+class LlamaForCausalLM(MoEPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.model = MoEModel(config)
@@ -768,6 +774,12 @@ class MoEForCausalLM(MoEPreTrainedModel):
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print("[ERROR] NaNs or Infs detected in logits!")
+            print("Logits min:", logits.min().item(), "Logits max:", logits.max().item())
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        logits = torch.clamp(logits, min=0.0)
+        
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
@@ -822,6 +834,18 @@ class MoEForCausalLM(MoEPreTrainedModel):
             }
         )
         return model_inputs
+    
+    def prepare_logits_processor(self, **kwargs):
+        def _process(logits):
+            # Debugging for NaNs and Infs
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print("[ERROR] NaNs or Infs detected in logits during processing.")
+                print("Logits min:", logits.min().item(), "Logits max:", logits.max().item())
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Ensure no negative values
+            logits = torch.clamp(logits, min=0.0)
+            return logits
+        return [_process]
 
     @staticmethod
     def _reorder_cache(past_key_values, beam_idx):
