@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 
@@ -239,6 +240,99 @@ class SwitchMLP(nn.Module):
 
         output_total = output_total.view(s, b, h)
         return output_total
+
+# class SwitchMLP(nn.Module):
+#     """
+#     Routes input to one of N MLP "experts" with stability adjustments for LLaMA 2.
+#     """
+#     def __init__(self, config, layer_idx):
+#         super(SwitchMLP, self).__init__()
+#         self.layer_num = layer_idx
+#         self.use_switch = (layer_idx % config.expert_frequency) == 0
+
+#         if self.use_switch:
+#             self.top_p_threshold = config.top_p_threshold
+#             self.router = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+#             self.experts = nn.ModuleList()
+#             self.num_experts = config.num_experts
+            
+#             # Expert MLP Initialization
+#             for _ in range(config.num_experts):
+#                 expert = nn.Sequential(
+#                     nn.Linear(config.hidden_size, config.intermediate_size),
+#                     nn.GELU(),
+#                     nn.Linear(config.intermediate_size, config.hidden_size)
+#                 )
+#                 self.experts.append(expert)
+
+#             # Router Initialization
+#             nn.init.xavier_uniform_(self.router.weight)
+#         else:
+#             self.mlp = nn.Sequential(
+#                 nn.Linear(config.hidden_size, config.intermediate_size),
+#                 nn.GELU(),
+#                 nn.Linear(config.intermediate_size, config.hidden_size)
+#             )
+
+#     def forward(self, hidden_states):
+#         if not self.use_switch:
+#             return self.mlp(hidden_states)
+
+#         # Routing
+#         route_logits = self.router(hidden_states)
+#         route_logits = torch.nan_to_num(route_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        
+#         # Stable softmax
+#         route_probs = F.softmax(route_logits, dim=2)
+        
+#         if torch.any(torch.isnan(route_probs)) or torch.any(torch.isinf(route_probs)):
+#             print("[DEBUG] NaNs/Infs detected in routing probabilities after softmax!")
+#             print(f"[DEBUG] Routing probs stats - Min: {route_probs.min().item()}, Max: {route_probs.max().item()}")
+
+        
+#         # Top-p sampling
+#         sorted_probs, sorted_indices = torch.sort(route_probs, descending=True, dim=2)
+#         cumulative_probs = torch.cumsum(sorted_probs, dim=2)
+#         mask = cumulative_probs > self.top_p_threshold
+#         threshold_indices = mask.long().argmax(dim=2)
+#         threshold_mask = F.one_hot(threshold_indices, num_classes=sorted_indices.size(-1)).bool()
+#         mask = mask & ~threshold_mask
+        
+#         sorted_indices = torch.where(mask, -1, sorted_indices)
+#         sorted_probs = torch.where(mask, 0.0, sorted_probs)  
+
+#         # Prepare for expert processing
+#         batch_size, seq_len, hidden_dim = hidden_states.size()
+#         flat_hidden_states = hidden_states.view(-1, hidden_dim)
+
+#         # Initialize the output tensor
+#         output_total = torch.zeros_like(flat_hidden_states)
+
+#         # Forward pass through each expert
+#         for expert_num, expert in enumerate(self.experts):
+#             mask = sorted_indices == expert_num
+#             flat_mask = mask.view(-1)
+            
+#             if flat_mask.sum().item() > 0:
+#                 # Extract the indices of samples for this expert
+#                 sample_ind = flat_mask.nonzero(as_tuple=True)[0]
+                
+#                 # Select the hidden states for those indices
+#                 inputs_to_expert = flat_hidden_states[sample_ind]
+                
+#                 # Forward pass through the expert
+#                 expert_output = expert(inputs_to_expert)
+                
+#                 # Handle NaNs and Infs
+#                 expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=1e4, neginf=-1e4)
+                
+#                 # Weight outputs by probabilities
+#                 prob_weights = sorted_probs.view(-1, sorted_probs.size(-1))[sample_ind, expert_num].unsqueeze(-1)
+#                 output_total[sample_ind] += expert_output * prob_weights
+        
+#         # Reshape to original size
+#         output_total = output_total.view(batch_size, seq_len, hidden_dim)
+#         return output_total
                 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
