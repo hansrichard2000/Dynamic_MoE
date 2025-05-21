@@ -84,9 +84,18 @@ class LlamaConfig(PretrainedConfig):
             https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
             experimental feature, subject to breaking API changes in future versions.
     """
+    _instance = None
     model_type = "llama"
     keys_to_ignore_at_inference = ["past_key_values"]
-
+    
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(LlamaConfig, cls).__new__(cls)
+            print("[INFO] LlamaConfig instance created.")
+        else:
+            print("[INFO] LlamaConfig instance reused.")
+        return cls._instance
+    
     def __init__(
         self,
         vocab_size=32000,
@@ -107,12 +116,43 @@ class LlamaConfig(PretrainedConfig):
         tie_word_embeddings=False,
         rope_theta=10000.0,
         rope_scaling=None,
-        num_experts=1,
+        num_experts=4,
         experts_topk=2,
         expert_frequency=2,
         top_p_threshold=0.4,
         **kwargs,
     ):
+        # Avoid running __init__ if it's already initialized
+        if hasattr(self, '_is_initialized') and self._is_initialized:
+            print("[INFO] LlamaConfig is already initialized. Skipping __init__.")
+            return
+        
+        # Mark as initialized
+        self._is_initialized = True
+        
+        # Normal init process
+        # self.vocab_size=32000,
+        # self.hidden_size=4096,
+        # self.intermediate_size=11008,
+        # self.num_hidden_layers=32,
+        # self.num_attention_heads=32,
+        # self.num_key_value_heads=None,
+        # self.hidden_act="silu",
+        # self.max_position_embeddings=2048,
+        # self.initializer_range=0.02,
+        # self.rms_norm_eps=1e-6,
+        # self.use_cache=True,
+        # self.pad_token_id=None,
+        # self.bos_token_id=1,
+        # self.eos_token_id=2,
+        # self.pretraining_tp=1,
+        # self.tie_word_embeddings=False,
+        # self.rope_theta=10000.0,
+        # self.rope_scaling=None,
+        # self.num_experts=4,
+        # self.experts_topk=2,
+        # self.expert_frequency=2,
+        # self.top_p_threshold=0.4,
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -120,6 +160,7 @@ class LlamaConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.num_experts = num_experts
+        print("[CONFIGURATION NUM EXPERTS]:", num_experts)
         self.expert_frequency = expert_frequency
         self.experts_topk = experts_topk 
         self.top_p_threshold = top_p_threshold

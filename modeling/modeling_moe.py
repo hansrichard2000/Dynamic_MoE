@@ -25,7 +25,7 @@ import torch.utils.checkpoint
 from torch import nn
 import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-
+import matplotlib.pyplot as plt
 
 from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
@@ -122,7 +122,6 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
 
-
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -194,13 +193,26 @@ class SwitchMLP(nn.Module):
         super(SwitchMLP, self).__init__()
         self.layer_num = layer_idx
         self.use_switch = (layer_idx % config.expert_frequency) == 0 # Ensure the first layer use switch mlp
+        
         if self.use_switch:
             self.top_p_threshold = config.top_p_threshold
+            
+            # Router Initialization with Xavier Normal
             self.router = torch.nn.Linear(config.hidden_size, config.num_experts, bias=False)
+            torch.nn.init.xavier_normal_(self.router.weight)
+            
             self.experts = torch.nn.ModuleList()
             self.num_experts = config.num_experts
+            print(f"[DEBUG] Number of Experts Configured: {self.num_experts}")
+            print(f"[DEBUG] Experts Initialized: {len(self.experts)}")
+            
+            # Initialize experts with proper weight initialization
             for i in range(config.num_experts):
-                self.experts.append(LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act))
+                expert = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+                for layer in expert.children():
+                    if isinstance(layer, nn.Linear):
+                        torch.nn.init.xavier_normal_(layer.weight)
+                self.experts.append(expert)
         else:
             self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
         
@@ -213,33 +225,126 @@ class SwitchMLP(nn.Module):
         b = hidden_states.size(1)
         h = hidden_states.size(2)
 
+        # Routing: Generate expert scores and apply softmax
         route = self.router(hidden_states) 
+        
+        # Prevent overflow during softmax
+        route = torch.clamp(route, min=-10, max=10)
         route = torch.nn.functional.softmax(route, dim=2)
         
-
+        # Check for NaNs or Infs
+        if torch.isnan(route).any() or torch.isinf(route).any():
+            print("[DEBUG] NaNs/Infs detected in routing weights.")
+            route = torch.nan_to_num(route, nan=0.0, posinf=1e4, neginf=-1e4)
+        
+        # Select the top-k experts
         topk_weights, topk_ind = top_p_sampling_batched_all_sequence(route, self.top_p_threshold)
         
-
         hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
         topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
         topk_ind = topk_ind.view(-1, topk_ind.size(2))
 
-        output_total = torch.zeros_like(hidden_states).to(hidden_states)
+        output_total = torch.zeros_like(hidden_states).to(hidden_states.device)
+        
+        # Initialize a dictionary to count activations
+        expert_usage = {i: 0 for i in range(self.num_experts)}
+        
+        # Execute experts and accumulate outputs
         for expert_num, expert in enumerate(self.experts):
-            sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
-            hidden = hidden_states[sample_ind.unsqueeze(1), :] 
-            expert_output = expert(hidden)
+            sample_ind, expert_ind = torch.where(topk_ind == expert_num)
             
-            # Debugging for NaNs/Infs
-            if torch.isnan(expert_output).any() or torch.isinf(expert_output).any():
-                print(f"[DEBUG] NaNs/Infs detected in expert {expert_num}")
-                expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Count activations for visualization
+            expert_usage[expert_num] += sample_ind.numel()
             
-            output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
+            # Avoid empty masks 
+            if sample_ind.numel() > 0 and expert_ind.numel() > 0:
+                
+                hidden = hidden_states[sample_ind.unsqueeze(1), :] 
+                expert_output = expert(hidden)
+            
+                # Debugging for NaNs/Infs
+                if torch.isnan(expert_output).any() or torch.isinf(expert_output).any():
+                    print(f"[DEBUG] NaNs/Infs detected in expert {expert_num}")
+                    expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=1e4, neginf=-1e4)
 
+                # # Show debugging for each expert
+                print(f"[INFO] Expert {expert_num} activated for {len(sample_ind)} samples.")
+                print(f"[INFO] Expert {expert_num} Weights: {topk_weights[sample_ind, expert_ind]}")
+                print(f"[INFO] Expert {expert_num} Output (sample): {expert_output[0, :5]}")
+                
+                output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
 
+        # Visualization of Expert Usage
+        # print("[INFO] === Routing Information ===")
+        # for k, v in expert_usage.items():
+        #     print(f"[INFO] Expert {k} activated for {v} samples.")
+
+        # Plot the distribution of expert usage
+        # plt.bar(expert_usage.keys(), expert_usage.values())
+        # plt.title("Distribution of Samples Routed to Each Expert")
+        # plt.xlabel("Expert Index")
+        # plt.ylabel("Number of Samples")
+        # plt.show()
+        
         output_total = output_total.view(s, b, h)
         return output_total
+
+# class SwitchMLP(nn.Module):
+#     """
+#     Routes input to one of N MLP "experts"
+#     """
+#     def __init__(self, config, layer_idx):
+#         super(SwitchMLP, self).__init__()
+#         self.layer_num = layer_idx
+#         self.use_switch = (layer_idx % config.expert_frequency) == 0 # Ensure the first layer use switch mlp
+        
+#         if self.use_switch:
+#             self.top_p_threshold = config.top_p_threshold
+            
+#             self.router = torch.nn.Linear(config.hidden_size, config.num_experts, bias=False)
+#             self.experts = torch.nn.ModuleList()
+#             self.num_experts = config.num_experts
+#             for i in range(config.num_experts):
+#                 self.experts.append(LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act))
+#         else:
+#             self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+        
+#     def forward(self, hidden_states):
+#         if not self.use_switch:
+#             output = self.mlp(hidden_states)
+#             return output
+
+#         s = hidden_states.size(0)
+#         b = hidden_states.size(1)
+#         h = hidden_states.size(2)
+
+#         route = self.router(hidden_states) 
+#         route = torch.nn.functional.softmax(route, dim=2)
+        
+
+#         topk_weights, topk_ind = top_p_sampling_batched_all_sequence(route, self.top_p_threshold)
+        
+
+#         hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
+#         topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
+#         topk_ind = topk_ind.view(-1, topk_ind.size(2))
+
+#         output_total = torch.zeros_like(hidden_states).to(hidden_states)
+#         for expert_num, expert in enumerate(self.experts):
+#             sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
+#             hidden = hidden_states[sample_ind.unsqueeze(1), :] 
+#             expert_output = expert(hidden)
+            
+#             # Debugging for NaNs/Infs
+#             if torch.isnan(expert_output).any() or torch.isinf(expert_output).any():
+#                 print(f"[DEBUG] NaNs/Infs detected in expert {expert_num}")
+#                 expert_output = torch.nan_to_num(expert_output, nan=0.0, posinf=1e4, neginf=-1e4)
+            
+#             output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
+
+
+#         output_total = output_total.view(s, b, h)
+#         return output_total
 
 # class SwitchMLP(nn.Module):
 #     """
@@ -614,6 +719,8 @@ class MoEModel(MoEPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        
+        print("[DEBUG MODEL] Config:", config)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
@@ -785,6 +892,8 @@ class LlamaForCausalLM(MoEPreTrainedModel):
         self.model = MoEModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        print("[DEBUG CONFIG LM] Config:", config)
+        
         # Initialize weights and apply final processing
         self.post_init()
 
